@@ -1,0 +1,27 @@
+image: python:latest
+stages:
+- package 
+- release
+
+package:
+  stage: package
+  script:
+    - pip install build twine
+    - python -m build
+    - TWINE_PASSWORD=${CI_JOB_TOKEN} TWINE_USERNAME=gitlab-ci-token python -m twine upload --skip-existing --repository-url ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/pypi dist/*
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      when: never 
+
+release_job:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+  script:
+    - echo "running release_job"
+  release:
+    tag_name: '$CI_COMMIT_TAG'
+    description: '$CI_COMMIT_TAG'

@@ -1,0 +1,251 @@
+#!/usr/bin/env python3 
+
+try:
+    import argparse 
+    import json
+    import os 
+    import sys
+    import time
+    from typing import Tuple 
+    from firemod import (
+        fireprox,
+        auth as fp_auth,
+        types,
+    )
+    from alive_progress import alive_bar
+    from pydantic import BaseModel 
+    from typing import Union,List
+except ModuleNotFoundError as err:
+    print(str(err))
+    print("Did you run 'pip install -r requirements'?")
+    exit()
+
+class ParserKVAction(argparse.Action):
+    def __call__(self, parser: argparse.ArgumentParser, namespace: argparse.Namespace, values, option_string=None):
+        if not isinstance(self.dest,dict):
+            setattr(namespace, self.dest, dict())
+        for value in values:
+            try:
+                key, v = value.split('=')
+                getattr(namespace, self.dest)[key] = v
+            except ValueError as ex:
+                message = "\nTraceback: {}".format(ex)
+                message += "\nError on '{}' || It should be 'key=value'".format(v)
+                raise argparse.ArgumentError(self, str(message))
+
+class CLIResponse(BaseModel):
+    errors: Union[List,None]
+    data: Union[List,None]
+
+    def json(self):
+        return json.dumps( self.dict(), default=str )
+    
+    def __str__(self):
+        ret = []
+        if len(self.errors) > 0:
+            ret += ['--- Errors --- ']
+            ret += [f'[error] {str(e)}' for e in self.errors]
+            ret += ['']
+        if len(self.data) > 0:
+            ret += ['--- Data --- ']
+            ret += [f'[{d.status}][API ID: {d.id}] {d.url} => {d.proxy_url}' for d in self.data]
+        return '\n'.join(ret )
+
+
+class CLIException(Exception): pass 
+
+def Error(m: str):
+    """
+    Pretty print error with "[Error]" prefix.
+
+    :param m: Message to be printed with prefix.
+    """
+    print('[Error] ' + str(m))
+
+def parse_arguments() -> Tuple[argparse.Namespace, str]:
+    """
+    Parse command line arguments and return namespace
+
+    :return: Namespace for arguments and help text as a tuple
+    """
+    parser = argparse.ArgumentParser(description='FireProx API Gateway Manager')   
+    parser.add_argument('--progress',
+                        help='Show progress updates on console',
+                        action='store_true') 
+    parser.add_argument('--profile',
+                        help='AWS Profile Name to store/retrieve credentials', 
+                        type=str, 
+                        default=os.environ.get("AWS_PROFILE_NAME",None))
+    parser.add_argument('--aws-access-key-id',
+                        help='AWS Access Key ID', 
+                        type=str, 
+                        default=os.environ.get("AWS_ACCESS_KEY_ID",None))
+    parser.add_argument('--aws-secret-access-key',
+                        help='AWS Secret Access Key', 
+                        type=str, 
+                        default=os.environ.get("AWS_SECRET_ACCESS_KEY",None))
+    parser.add_argument('--aws-session-token',
+                        help='AWS Session Token', 
+                        type=str, 
+                        default=os.environ.get("AWS_SESSION_TOKEN",None))
+    parser.add_argument('--region',
+                        help='AWS Region', 
+                        type=str, 
+                        default=os.environ.get("AWS_DEFAULT_REGION",None))
+    parser.add_argument('--json',
+                        help='Output as JSON', 
+                        action='store_true', 
+                        default=False)
+    
+    subparsers = parser.add_subparsers(dest="command")
+
+    create_parser = subparsers.add_parser("create")
+    create_parser.add_argument(
+        "--url",
+        "-u",
+        type=str,
+        help="Target of remote.",
+        required=True)
+    create_parser.add_argument(
+        "--owner",
+        type=types.FireProxOwner,
+    )
+
+    delete_parser = subparsers.add_parser("delete")
+    exclusive_delete_group = delete_parser.add_mutually_exclusive_group(required=True)
+    exclusive_delete_group.add_argument(
+        "--force-all",
+        action='store_true',
+        help="Delete *ALL* API Gateways configured in tenancy")
+    exclusive_delete_group.add_argument(
+        "--api-id",
+        "-i",
+        type=str,
+        metavar='id',
+        help="API ID of Gateway to delete.")
+    
+    # update_parser = subparsers.add_parser("update")
+    # update_parser.add_argument(
+    #     "--api-id",
+    #     "-i",
+    #     type=str,
+    #     help="API ID of Gateway to update",
+    #     required=True)
+    # update_parser.add_argument(
+    #     "--url",
+    #     "-u",
+    #     type=str,
+    #     help="URL to update API Gateway",
+    #     required=True)
+
+    list_parser = subparsers.add_parser("list")
+
+    return parser.parse_args(), parser.format_help()
+
+def printList(elements: types.FireProxResponse ,out_json: bool = False):
+    """
+    Simple function to print list items.
+
+    :param elements: List if elements to print
+    :param out_json: If True, output as json
+    """
+    ret = []
+    for e in elements:
+        if out_json:
+            ret.append(e.dict())
+        else:
+            print(f"[{e.status}] api_id={e.api_id}, url={e.url}, proxy_url={e.proxy_url}")
+    if out_json:
+        print(json.dumps({
+            "data":ret
+        },default=str))
+
+def main(args):
+    if args.profile:
+        auth = fp_auth.ProfileAuth(
+            profile_name=args.profile,
+        )
+
+    elif args.aws_access_key_id and args.aws_secret_access_key:
+        if not args.region:
+            args.error('Please provide a region with AWS credentials')
+        auth = fp_auth.KeyAuth(
+            aws_access_key_id = args.aws_access_key_id,
+            aws_secret_access_key = args.aws_secret_access_key, 
+            aws_session_token = args.aws_session_token,
+            region_name = args.region,
+        )
+
+    else:
+        raise CLIException('Unable to load AWS credentials')
+
+    f = fireprox.FireProx(auth=auth)
+
+    cmd = args.command
+    if cmd == None:
+        print(help)
+        exit()
+
+    errors = []
+    data = []
+    
+    with alive_bar(title="Working",
+                   length=3,
+                   disable=not args.progress,
+                   file=sys.stderr) as bar:
+        if cmd == "list":
+            bar.title=f"Gathering List"
+            data += f.List()
+            if len(data) == 0:
+                errors.append("No configured API Gateways to list.")
+                
+        elif cmd == "create":
+            bar.title=f"Creating: {args.url}"
+            d = f.Create(args.url)
+            if args.owner:
+                d = f.Tag(d.api_id, args.owner)
+            data.append(d)
+
+        elif cmd == "delete":
+            if args.force_all:
+                resources = f.List()
+
+                if len(resources) == 0:
+                    errors.append("No configured API Gateways to delete.")
+
+                for resource in f.List():
+                    bar.title=f"Deleting All: {resource.id}"
+                    while True:
+                        try:
+                            data.append(
+                                f.Delete(resource.id)
+                            )
+                            bar()
+                            break 
+                        except f.client.exceptions.TooManyRequestsException:
+                            print('Boto3 Core Rate Limited - trying again in 3 seconds...')
+                        # this is shit
+                        # Only allows a couple of requests through before rate limited 
+                        # need to find another way around rate limits thats not shit
+                        time.sleep(3) 
+
+            else:
+                bar.title=f"Deleting: {args.id}"
+                data.append(f.Delete(args.id))
+        bar()
+
+    resp = CLIResponse(errors=errors,data=data)
+
+    if args.json:
+        print( resp.json() )
+    else:
+        print(resp)
+    return None 
+
+if __name__ == "__main__":
+    args, help = parse_arguments()
+    try:
+        main(args)
+    except CLIException as e:
+        Error(str(e))
+        print(help)
