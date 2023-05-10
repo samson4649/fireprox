@@ -121,7 +121,7 @@ def parse_arguments() -> Tuple[argparse.Namespace, str]:
         "--api-id",
         "-i",
         type=str,
-        metavar='id',
+        dest='id',
         help="API ID of Gateway to delete.")
     
     # update_parser = subparsers.add_parser("update")
